@@ -108,8 +108,8 @@ use crate::types::constraints::projection::{ProjectionError, SolutionBudget};
 use crate::types::constraints::support::{Support, SupportId};
 use crate::types::typevar::{BoundTypeVarIdentity, TypeVarInstance, TypeVarSet};
 use crate::types::visitor::{
-    NonAtomicType, TypeCollector, TypeKind, TypeVisitor, walk_non_atomic_type,
-    walk_type_with_recursion_guard,
+    NonAtomicType, TypeCollector, TypeKind, TypeVisitor, any_over_type_expanding_aliases,
+    walk_non_atomic_type, walk_type_with_recursion_guard,
 };
 use crate::types::{
     ApplyTypeMappingVisitor, BoundTypeVarInstance, IntersectionType, Type, TypeContext,
@@ -3083,6 +3083,7 @@ impl<'db> PathBoundBuilder<'db> {
 }
 
 /// The result of selecting a type for one typevar on one constraint path.
+/// Declaration failures carry the evidence to report, if it fits the type-construction budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathBoundSolution<'db> {
     Solved(Type<'db>),
@@ -3091,11 +3092,8 @@ pub(crate) enum PathBoundSolution<'db> {
     /// The path's lower and upper bounds cannot be satisfied together
     Unsatisfiable,
     /// The path does not satisfy the typevar's declared upper bound
-    ViolatesDeclaredUpperBound,
-    /// The path does not satisfy the typevar's declared constraints.
-    ///
-    /// The payload is the evidence to report. It is `None` if intersecting upper-bound evidence
-    /// exceeds the type-construction budget; the declaration violation is still known.
+    ViolatesDeclaredUpperBound(Option<Type<'db>>),
+    /// The path does not satisfy the typevar's declared constraints
     ViolatesDeclaredConstraints(Option<Type<'db>>),
     /// Computing the solution exceeded the type-construction budget. A previously known type
     /// can still be used as a conservative fallback, but is not a complete solution.
@@ -3114,7 +3112,7 @@ impl<'db> PathBoundSolution<'db> {
             },
             Self::Unsolved
             | Self::Unsatisfiable
-            | Self::ViolatesDeclaredUpperBound
+            | Self::ViolatesDeclaredUpperBound(_)
             | Self::ViolatesDeclaredConstraints(_) => self,
         }
     }
@@ -3126,9 +3124,58 @@ impl<'db> PathBoundSolution<'db> {
             Self::Solved(ty) => Some(ty),
             Self::Unsolved
             | Self::Unsatisfiable
-            | Self::ViolatesDeclaredUpperBound
+            | Self::ViolatesDeclaredUpperBound(_)
             | Self::ViolatesDeclaredConstraints(_) => None,
             Self::BudgetExceeded { fallback } => fallback,
+        }
+    }
+
+    /// Checks declarations for solutions containing type variables fixed by an outer caller.
+    ///
+    /// TODO: Remove this check when solving preserves universal validity for non-inferable
+    /// variables. A raw constraint can accept `S <= T` with `T: str` for some `S`, but inferring
+    /// `T = S` is valid only if every type allowed by the caller's `S` satisfies the bound.
+    /// Relations involving other variables being inferred are left for subsequent solving.
+    pub(crate) fn validate_noninferable(
+        self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        builder: &ConstraintSetBuilder<'db>,
+        inferable: TypeVarSet<'db>,
+        bound_typevar: BoundTypeVarInstance<'db>,
+    ) -> Self {
+        let Self::Solved(solution) = self else {
+            return self;
+        };
+        let Some(declaration) = bound_typevar.typevar(db).bound_or_constraints(db, env) else {
+            return self;
+        };
+        if !any_over_type_expanding_aliases(db, env, solution, Type::is_type_var)
+            || any_over_type_expanding_aliases(db, env, solution, |nested| {
+                nested
+                    .as_typevar()
+                    .is_some_and(|typevar| typevar.is_inferable(db, inferable))
+            })
+        {
+            return self;
+        }
+
+        let satisfies = |target| {
+            solution
+                .when_assignable_to(db, env, target, builder, inferable)
+                .is_always_satisfied(db, env)
+        };
+        match declaration {
+            TypeVarBoundOrConstraints::UpperBound(bound) if !satisfies(bound) => {
+                Self::ViolatesDeclaredUpperBound(Some(solution))
+            }
+            TypeVarBoundOrConstraints::Constraints(constraints)
+                if !constraints.accepts_typevar(db, env, solution)
+                    && !constraints.elements(db).iter().copied().any(satisfies) =>
+            {
+                Self::ViolatesDeclaredConstraints(Some(solution))
+            }
+            _ => self,
         }
     }
 }
@@ -3157,21 +3204,9 @@ impl<'db> PathBound<'db> {
         }
     }
 
-    /// Allows tests to construct conflicting bounds that relation construction would reject.
-    #[cfg(test)]
-    pub(crate) fn with_upper_evidence(mut self, upper: Type<'db>) -> Self {
-        self.upper = UpperBound::from_clause(upper);
-        self
-    }
-
     /// Returns lower-bound inference evidence without supplying a default for a missing bound.
     pub(crate) fn evidence_lower(&self) -> Option<Type<'db>> {
         self.evidence_lower
-    }
-
-    /// Returns upper-bound inference evidence without including validity requirements.
-    pub(crate) fn iter_upper_evidence(&self) -> impl Iterator<Item = Type<'db>> + Clone + '_ {
-        self.upper.iter_evidence()
     }
 
     /// Returns one effective upper bound without expanding factored intersections.
@@ -3193,7 +3228,7 @@ impl<'db> PathBound<'db> {
         UnionType::from_elements(db, env, [evidence_lower, self.validity_lower])
     }
 
-    pub(crate) fn variance(&self) -> TypeVarVariance {
+    fn variance(&self) -> TypeVarVariance {
         match (self.evidence_lower.is_some(), self.has_upper_evidence()) {
             (false, true) => TypeVarVariance::Covariant,
             (true, false) => TypeVarVariance::Contravariant,
@@ -3204,6 +3239,54 @@ impl<'db> PathBound<'db> {
 
     pub(crate) fn has_upper_evidence(&self) -> bool {
         self.upper.has_evidence()
+    }
+
+    /// Classifies a path for which no declared constraint is a valid solution.
+    ///
+    /// Inferred bounds can contradict each other without violating the declaration itself.
+    /// For `T: (int, str)`, `int <= T <= str` is a generic unsatisfiable constraint, while
+    /// `T = bytes` and `T <= bool` provide evidence of a declaration violation.
+    fn constrained_failure(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+        builder: &ConstraintSetBuilder<'db>,
+        declared_constraints: &[Type<'db>],
+    ) -> PathBoundSolution<'db> {
+        let lower = self.evidence_lower.filter(|argument| {
+            declared_constraints.iter().all(|constraint| {
+                argument
+                    .when_constraint_set_assignable_to(
+                        db,
+                        env,
+                        constraint.top_materialization(db, env),
+                        builder,
+                    )
+                    .is_never_satisfied(db, env)
+            })
+        });
+        if lower.is_some() {
+            return PathBoundSolution::ViolatesDeclaredConstraints(lower);
+        }
+
+        if self.has_upper_evidence()
+            && declared_constraints.iter().all(|constraint| {
+                self.upper
+                    .iter_evidence()
+                    .when_all(db, builder, |upper| {
+                        constraint
+                            .bottom_materialization(db, env)
+                            .when_constraint_set_assignable_to(db, env, upper, builder)
+                    })
+                    .is_never_satisfied(db, env)
+            })
+        {
+            return PathBoundSolution::ViolatesDeclaredConstraints(
+                IntersectionType::bounded_from_elements(db, env, self.upper.iter_evidence()),
+            );
+        }
+
+        PathBoundSolution::Unsatisfiable
     }
 
     /// Restricts the range of a gradual solution by the upper bounds inferred for this constraint.
@@ -3718,10 +3801,10 @@ impl<'db> CandidateSolutions<'db> {
                 PathBoundSolution::Solved(ty) => Some(ty),
                 PathBoundSolution::Unsolved => None,
                 PathBoundSolution::Unsatisfiable => return None,
-                PathBoundSolution::ViolatesDeclaredUpperBound => {
+                PathBoundSolution::ViolatesDeclaredUpperBound(argument) => {
                     violations.push(SolutionViolation {
                         bound_typevar: path_bound.bound_typevar,
-                        argument: path_bound.evidence_lower(),
+                        argument,
                         variance: path_bound.variance(),
                         kind: SolutionViolationKind::UpperBound,
                     });
@@ -3817,14 +3900,25 @@ impl<'db> CandidateSolutions<'db> {
                 // Prefer the lower bound (often the concrete actual type seen) over the
                 // upper bound (which may include TypeVar bounds/constraints). The upper bound
                 // should only be used as a fallback when no concrete type was inferred.
-                if path_bound.evidence_lower.is_some() {
+                if let Some(evidence_lower) = path_bound.evidence_lower {
                     if !is_possibly_constraint_set_assignable(
                         db,
-                        TypePair::new(db, env.program(db), lower, declared_upper),
+                        TypePair::new(db, env.program(db), evidence_lower, declared_upper),
                     ) {
                         // Prefer a declared-bound violation when the inferred bounds are also
                         // contradictory, so callers can report the more specific cause.
-                        return PathBoundSolution::ViolatesDeclaredUpperBound;
+                        return PathBoundSolution::ViolatesDeclaredUpperBound(Some(evidence_lower));
+                    }
+
+                    // A validity requirement can make the path impossible without the inferred
+                    // evidence violating the declaration.
+                    if lower != evidence_lower
+                        && !is_possibly_constraint_set_assignable(
+                            db,
+                            TypePair::new(db, env.program(db), lower, declared_upper),
+                        )
+                    {
+                        return PathBoundSolution::Unsatisfiable;
                     }
 
                     if !path_bound.upper.is_satisfied_by(db, env, lower) {
@@ -3977,49 +4071,12 @@ impl<'db> CandidateSolutions<'db> {
                 }
 
                 let Some(compatible_constraint) = compatible_constraint else {
-                    // No declared constraint satisfies the full path. Report a declaration
-                    // violation only if the lower evidence alone, or the upper evidence alone,
-                    // excludes every constraint. For `T: (int, str)`, `int <= T <= str` is
-                    // unsatisfiable without either bound independently violating the declaration,
-                    // while `T = bytes` and `T <= bool` do provide evidence of a violation.
-                    if let Some(lower) = path_bound.evidence_lower
-                        && constraints.elements(db).iter().all(|constraint| {
-                            lower
-                                .when_constraint_set_assignable_to(
-                                    db,
-                                    env,
-                                    constraint.top_materialization(db, env),
-                                    builder,
-                                )
-                                .is_never_satisfied(db, env)
-                        })
-                    {
-                        return PathBoundSolution::ViolatesDeclaredConstraints(Some(lower));
-                    }
-
-                    if path_bound.has_upper_evidence()
-                        && constraints.elements(db).iter().all(|constraint| {
-                            path_bound
-                                .upper
-                                .iter_evidence()
-                                .when_all(db, builder, |upper| {
-                                    constraint
-                                        .bottom_materialization(db, env)
-                                        .when_constraint_set_assignable_to(db, env, upper, builder)
-                                })
-                                .is_never_satisfied(db, env)
-                        })
-                    {
-                        return PathBoundSolution::ViolatesDeclaredConstraints(
-                            IntersectionType::bounded_from_elements(
-                                db,
-                                env,
-                                path_bound.upper.iter_evidence(),
-                            ),
-                        );
-                    }
-
-                    return PathBoundSolution::Unsatisfiable;
+                    return path_bound.constrained_failure(
+                        db,
+                        env,
+                        builder,
+                        constraints.elements(db),
+                    );
                 };
 
                 if let Some(ty) = dependent_solution {
@@ -4553,17 +4610,17 @@ impl<'db> SolutionPaths<'db> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
-enum SolutionViolationKind {
+pub(crate) enum SolutionViolationKind {
     UpperBound,
     Constraints,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
 pub(crate) struct SolutionViolation<'db> {
-    bound_typevar: BoundTypeVarInstance<'db>,
-    argument: Option<Type<'db>>,
-    variance: TypeVarVariance,
-    kind: SolutionViolationKind,
+    pub(crate) bound_typevar: BoundTypeVarInstance<'db>,
+    pub(crate) argument: Option<Type<'db>>,
+    pub(crate) variance: TypeVarVariance,
+    pub(crate) kind: SolutionViolationKind,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, get_size2::GetSize, salsa::SalsaValue)]
@@ -4587,7 +4644,7 @@ impl<'db> Solution<'db> {
         matches!(self.validity, SolutionValidity::Valid)
     }
 
-    fn violations(&self) -> &[SolutionViolation<'db>] {
+    pub(crate) fn violations(&self) -> &[SolutionViolation<'db>] {
         match &self.validity {
             SolutionValidity::Valid => &[],
             SolutionValidity::Invalid(violations) => violations,
@@ -5734,6 +5791,39 @@ mod tests {
             assert_eq!(
                 candidates.solve(db, &env, &builder, inferable),
                 Solutions::Unsatisfiable(SolutionPaths::Complete(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn validity_conflicts_do_not_implicate_compatible_evidence() {
+        let db = setup_db();
+        let db = &db;
+        let env = db.program_environment();
+        let int = known_instance(db, KnownClass::Int);
+        let str = known_instance(db, KnownClass::Str);
+        let bytes = known_instance(db, KnownClass::Bytes);
+        let builder = ConstraintSetBuilder::new();
+
+        for declaration in [
+            TypeVarBoundOrConstraints::UpperBound(int),
+            TypeVarBoundOrConstraints::Constraints(TypeVarConstraints::new(
+                db,
+                [int, str].as_slice(),
+            )),
+        ] {
+            let t = create_typevar(db, "T").map_bound_or_constraints(db, |_| Some(declaration));
+            let inferable = TypeVarSet::from_typevars(db, [t]);
+            let mut bounds = PathBoundBuilder::default();
+            bounds.add_lower(ConstraintProvenance::Evidence, int);
+            bounds.add_lower(ConstraintProvenance::Validity, bytes);
+            let candidates = CandidateSolutions::Constrained(Box::new([CandidateSolution {
+                typevars: Box::new([bounds.finish(db, &env, t)]),
+            }]));
+
+            assert_eq!(
+                candidates.solve(db, &env, &builder, inferable),
+                Solutions::Unsatisfiable(SolutionPaths::Complete(vec![]))
             );
         }
     }
