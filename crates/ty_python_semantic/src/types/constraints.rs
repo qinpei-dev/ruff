@@ -3083,7 +3083,6 @@ impl<'db> PathBoundBuilder<'db> {
 }
 
 /// The result of selecting a type for one typevar on one constraint path.
-/// Declaration failures carry the evidence to report, if it fits the type-construction budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PathBoundSolution<'db> {
     Solved(Type<'db>),
@@ -3091,9 +3090,12 @@ pub(crate) enum PathBoundSolution<'db> {
     Unsolved,
     /// The path's lower and upper bounds cannot be satisfied together
     Unsatisfiable,
-    /// The path does not satisfy the typevar's declared upper bound
-    ViolatesDeclaredUpperBound(Option<Type<'db>>),
-    /// The path does not satisfy the typevar's declared constraints
+    /// The path does not satisfy the typevar's declared upper bound.
+    ViolatesDeclaredUpperBound(Type<'db>),
+    /// The path does not satisfy the typevar's declared constraints.
+    ///
+    /// The payload is the evidence to report. It is `None` if intersecting upper-bound evidence
+    /// exceeds the type-construction budget; the declaration violation is still known.
     ViolatesDeclaredConstraints(Option<Type<'db>>),
     /// Computing the solution exceeded the type-construction budget. A previously known type
     /// can still be used as a conservative fallback, but is not a complete solution.
@@ -3167,7 +3169,7 @@ impl<'db> PathBoundSolution<'db> {
         };
         match declaration {
             TypeVarBoundOrConstraints::UpperBound(bound) if !satisfies(bound) => {
-                Self::ViolatesDeclaredUpperBound(Some(solution))
+                Self::ViolatesDeclaredUpperBound(solution)
             }
             TypeVarBoundOrConstraints::Constraints(constraints)
                 if !constraints.accepts_typevar(db, env, solution)
@@ -3804,7 +3806,7 @@ impl<'db> CandidateSolutions<'db> {
                 PathBoundSolution::ViolatesDeclaredUpperBound(argument) => {
                     violations.push(SolutionViolation {
                         bound_typevar: path_bound.bound_typevar,
-                        argument,
+                        argument: Some(argument),
                         variance: path_bound.variance(),
                         kind: SolutionViolationKind::UpperBound,
                     });
@@ -3907,7 +3909,7 @@ impl<'db> CandidateSolutions<'db> {
                     ) {
                         // Prefer a declared-bound violation when the inferred bounds are also
                         // contradictory, so callers can report the more specific cause.
-                        return PathBoundSolution::ViolatesDeclaredUpperBound(Some(evidence_lower));
+                        return PathBoundSolution::ViolatesDeclaredUpperBound(evidence_lower);
                     }
 
                     // A validity requirement can make the path impossible without the inferred
