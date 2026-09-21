@@ -3193,7 +3193,7 @@ impl<'db> PathBound<'db> {
         UnionType::from_elements(db, env, [evidence_lower, self.validity_lower])
     }
 
-    fn variance(&self) -> TypeVarVariance {
+    pub(crate) fn variance(&self) -> TypeVarVariance {
         match (self.evidence_lower.is_some(), self.has_upper_evidence()) {
             (false, true) => TypeVarVariance::Covariant,
             (true, false) => TypeVarVariance::Contravariant,
