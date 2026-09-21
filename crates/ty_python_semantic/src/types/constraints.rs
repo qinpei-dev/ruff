@@ -3186,7 +3186,7 @@ impl<'db> PathBoundSolution<'db> {
                     Self::ViolatesDeclaredConstraints(Some(solution))
                 }
             }
-            _ => self,
+            TypeVarBoundOrConstraints::UpperBound(_) => self,
         }
     }
 }
