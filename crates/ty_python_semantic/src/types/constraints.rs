@@ -3171,11 +3171,20 @@ impl<'db> PathBoundSolution<'db> {
             TypeVarBoundOrConstraints::UpperBound(bound) if !satisfies(bound) => {
                 Self::ViolatesDeclaredUpperBound(solution)
             }
-            TypeVarBoundOrConstraints::Constraints(constraints)
-                if !constraints.accepts_typevar(db, env, solution)
-                    && !constraints.elements(db).iter().copied().any(satisfies) =>
-            {
-                Self::ViolatesDeclaredConstraints(Some(solution))
+            TypeVarBoundOrConstraints::Constraints(constraints) => {
+                if let Type::TypeVar(solution_typevar) = solution.resolve_type_alias(db)
+                    && let Some(TypeVarBoundOrConstraints::Constraints(solution_constraints)) =
+                        solution_typevar.typevar(db).bound_or_constraints(db, env)
+                    && solution_constraints.is_subset_of(db, env, constraints)
+                {
+                    return self;
+                }
+
+                if constraints.elements(db).iter().copied().any(satisfies) {
+                    self
+                } else {
+                    Self::ViolatesDeclaredConstraints(Some(solution))
+                }
             }
             _ => self,
         }
