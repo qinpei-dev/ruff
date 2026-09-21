@@ -3243,54 +3243,6 @@ impl<'db> PathBound<'db> {
         self.upper.has_evidence()
     }
 
-    /// Classifies a path for which no declared constraint is a valid solution.
-    ///
-    /// Inferred bounds can contradict each other without violating the declaration itself.
-    /// For `T: (int, str)`, `int <= T <= str` is a generic unsatisfiable constraint, while
-    /// `T = bytes` and `T <= bool` provide evidence of a declaration violation.
-    fn constrained_failure(
-        &self,
-        db: &'db dyn Db,
-        env: &ProgramEnvironment<'db>,
-        builder: &ConstraintSetBuilder<'db>,
-        declared_constraints: &[Type<'db>],
-    ) -> PathBoundSolution<'db> {
-        let lower = self.evidence_lower.filter(|argument| {
-            declared_constraints.iter().all(|constraint| {
-                argument
-                    .when_constraint_set_assignable_to(
-                        db,
-                        env,
-                        constraint.top_materialization(db, env),
-                        builder,
-                    )
-                    .is_never_satisfied(db, env)
-            })
-        });
-        if lower.is_some() {
-            return PathBoundSolution::ViolatesDeclaredConstraints(lower);
-        }
-
-        if self.has_upper_evidence()
-            && declared_constraints.iter().all(|constraint| {
-                self.upper
-                    .iter_evidence()
-                    .when_all(db, builder, |upper| {
-                        constraint
-                            .bottom_materialization(db, env)
-                            .when_constraint_set_assignable_to(db, env, upper, builder)
-                    })
-                    .is_never_satisfied(db, env)
-            })
-        {
-            return PathBoundSolution::ViolatesDeclaredConstraints(
-                IntersectionType::bounded_from_elements(db, env, self.upper.iter_evidence()),
-            );
-        }
-
-        PathBoundSolution::Unsatisfiable
-    }
-
     /// Restricts the range of a gradual solution by the upper bounds inferred for this constraint.
     /// Returns `None` if constructing an intersection exceeds the solution budget.
     fn restrict_gradual_solution(
@@ -4073,12 +4025,49 @@ impl<'db> CandidateSolutions<'db> {
                 }
 
                 let Some(compatible_constraint) = compatible_constraint else {
-                    return path_bound.constrained_failure(
-                        db,
-                        env,
-                        builder,
-                        constraints.elements(db),
-                    );
+                    // No declared constraint satisfies the full path. Report a declaration
+                    // violation only if the lower evidence alone, or the upper evidence alone,
+                    // excludes every constraint. For `T: (int, str)`, `int <= T <= str` is
+                    // unsatisfiable without either bound independently violating the declaration,
+                    // while `T = bytes` and `T <= bool` do provide evidence of a violation.
+                    if let Some(lower) = path_bound.evidence_lower
+                        && constraints.elements(db).iter().all(|constraint| {
+                            lower
+                                .when_constraint_set_assignable_to(
+                                    db,
+                                    env,
+                                    constraint.top_materialization(db, env),
+                                    builder,
+                                )
+                                .is_never_satisfied(db, env)
+                        })
+                    {
+                        return PathBoundSolution::ViolatesDeclaredConstraints(Some(lower));
+                    }
+
+                    if path_bound.has_upper_evidence()
+                        && constraints.elements(db).iter().all(|constraint| {
+                            path_bound
+                                .upper
+                                .iter_evidence()
+                                .when_all(db, builder, |upper| {
+                                    constraint
+                                        .bottom_materialization(db, env)
+                                        .when_constraint_set_assignable_to(db, env, upper, builder)
+                                })
+                                .is_never_satisfied(db, env)
+                        })
+                    {
+                        return PathBoundSolution::ViolatesDeclaredConstraints(
+                            IntersectionType::bounded_from_elements(
+                                db,
+                                env,
+                                path_bound.upper.iter_evidence(),
+                            ),
+                        );
+                    }
+
+                    return PathBoundSolution::Unsatisfiable;
                 };
 
                 if let Some(ty) = dependent_solution {
