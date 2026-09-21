@@ -4445,7 +4445,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     };
                 if use_legacy_inference {
                     // TODO: Remove this compatibility path once gradual materialization evidence
-                    // is preserved (https://github.com/astral-sh/ruff/pull/26873). For example,
+                    // is preserved (https://github.com/astral-sh/ruff/pull/28307). For example,
                     // `Any & Source[str] <= Source[T]` becomes unconditionally true, losing the
                     // `str` contribution. Inferring each positive separately retains that evidence.
                     // Inspecting inferred types also catches gradual specializations inherited
