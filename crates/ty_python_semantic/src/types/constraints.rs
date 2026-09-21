@@ -3854,25 +3854,14 @@ impl<'db> CandidateSolutions<'db> {
                 // Prefer the lower bound (often the concrete actual type seen) over the
                 // upper bound (which may include TypeVar bounds/constraints). The upper bound
                 // should only be used as a fallback when no concrete type was inferred.
-                if let Some(evidence_lower) = path_bound.evidence_lower {
+                if path_bound.evidence_lower.is_some() {
                     if !is_possibly_constraint_set_assignable(
                         db,
-                        TypePair::new(db, env.program(db), evidence_lower, declared_upper),
+                        TypePair::new(db, env.program(db), lower, declared_upper),
                     ) {
                         // Prefer a declared-bound violation when the inferred bounds are also
                         // contradictory, so callers can report the more specific cause.
-                        return PathBoundSolution::ViolatesDeclaredUpperBound(evidence_lower);
-                    }
-
-                    // A validity requirement can make the path impossible without the inferred
-                    // evidence violating the declaration.
-                    if lower != evidence_lower
-                        && !is_possibly_constraint_set_assignable(
-                            db,
-                            TypePair::new(db, env.program(db), lower, declared_upper),
-                        )
-                    {
-                        return PathBoundSolution::Unsatisfiable;
+                        return PathBoundSolution::ViolatesDeclaredUpperBound(lower);
                     }
 
                     if !path_bound.upper.is_satisfied_by(db, env, lower) {
@@ -5782,39 +5771,6 @@ mod tests {
             assert_eq!(
                 candidates.solve(db, &env, &builder, inferable),
                 Solutions::Unsatisfiable(SolutionPaths::Complete(expected))
-            );
-        }
-    }
-
-    #[test]
-    fn validity_conflicts_do_not_implicate_compatible_evidence() {
-        let db = setup_db();
-        let db = &db;
-        let env = db.program_environment();
-        let int = known_instance(db, KnownClass::Int);
-        let str = known_instance(db, KnownClass::Str);
-        let bytes = known_instance(db, KnownClass::Bytes);
-        let builder = ConstraintSetBuilder::new();
-
-        for declaration in [
-            TypeVarBoundOrConstraints::UpperBound(int),
-            TypeVarBoundOrConstraints::Constraints(TypeVarConstraints::new(
-                db,
-                [int, str].as_slice(),
-            )),
-        ] {
-            let t = create_typevar(db, "T").map_bound_or_constraints(db, |_| Some(declaration));
-            let inferable = TypeVarSet::from_typevars(db, [t]);
-            let mut bounds = PathBoundBuilder::default();
-            bounds.add_lower(ConstraintProvenance::Evidence, int);
-            bounds.add_lower(ConstraintProvenance::Validity, bytes);
-            let candidates = CandidateSolutions::Constrained(Box::new([CandidateSolution {
-                typevars: Box::new([bounds.finish(db, &env, t)]),
-            }]));
-
-            assert_eq!(
-                candidates.solve(db, &env, &builder, inferable),
-                Solutions::Unsatisfiable(SolutionPaths::Complete(vec![]))
             );
         }
     }
