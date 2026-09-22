@@ -1016,7 +1016,7 @@ def check(value: Chain[tuple[int, str]]) -> None:
     });
 }
 
-/// Regression benchmark for subtyping between recursive protocols.
+/// Regression benchmark for subtyping between materialized recursive protocols.
 ///
 /// Subtyping checks between materialized specializations of a recursive protocol should terminate even
 /// though the recursive methods repeatedly introduce type variables and nested specializations.
